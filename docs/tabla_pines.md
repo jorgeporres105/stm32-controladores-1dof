@@ -1,42 +1,74 @@
-\# Tabla de pines (por confirmar)
+\# Tabla de pines – STM32 NUCLEO-L432KC + L298N + Motor con encoder
 
 
 
-\## Encoder (Timer en modo Encoder)
+\## Motor DC (potencia)
 
-\- ENC\_A: TBD
+\- M1 → L298N OUT1 (Motor A)
 
-\- ENC\_B: TBD
-
-
-
-\## PWM motor (Timer PWM)
-
-\- PWM\_EN: TBD
+\- M2 → L298N OUT2 (Motor A)
 
 
 
-\## Dirección puente H (GPIO)
+\## L298N (control Motor A)
 
-\- IN1: TBD
+\- ENA (PWM) → STM32 PA9  (TIM1\_CH2)
 
-\- IN2: TBD
+\- IN1 (DIR) → STM32 PB5  (GPIO Output)
 
-
-
-\## UART a PC (registro)
-
-\- TX: TBD
-
-\- RX: TBD
+\- IN2 (DIR) → STM32 PB4  (GPIO Output)
 
 
 
-\## Timer de control
+Notas:
 
-\- TIM control: TBD
+\- Quitar jumper ENA para usar PWM desde STM32.
 
-\- Frecuencia objetivo: 250 Hz o 1 kHz
+\- VIN y GND del L298N van a la batería (potencia).
+
+
+
+\## Encoder integrado (señales)
+
+\- C1 (Canal A) → STM32 PA0 (TIM2\_CH1)
+
+\- C2 (Canal B) → STM32 PA1 (TIM2\_CH2)
+
+\- VCC (encoder) → STM32 3V3 (si el encoder acepta 3.3V)
+
+\- GND (encoder) → GND común
+
+
+
+\## UART a PC (por USB / ST-Link)
+
+\- USART2\_TX → STM32 PA2
+
+\- USART2\_RX → STM32 PA3
+
+\- Baudrate: 115200
+
+
+
+\## Alimentación y tierras
+
+\- STM32: alimentado por USB
+
+\- L298N VIN: batería LiPo (+)
+
+\- L298N GND: batería LiPo (−)
+
+\- GND común: STM32 GND ↔ L298N GND ↔ Encoder GND
+
+
+
+\## V lógico (5V) del L298N
+
+\- No conectar el pin 5V del L298N al STM32.
+
+\- Si el jumper 5V-EN está puesto, el L298N se autoalimenta lógicamente desde VIN.
+
+\- Si el jumper 5V-EN está quitado, el L298N requiere 5V externos para su lógica (a definir según módulo).
 
 
 
