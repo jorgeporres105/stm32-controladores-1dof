@@ -1,21 +1,4 @@
-/* USER CODE BEGIN Header */
-/**
-  ******************************************************************************
-  * @file           : main.c
-  * @brief          : Main program body
-  ******************************************************************************
-  * @attention
-  *
-  * Copyright (c) 2025 STMicroelectronics.
-  * All rights reserved.
-  *
-  * This software is licensed under terms that can be found in the LICENSE file
-  * in the root directory of this software component.
-  * If no LICENSE file comes with this software, it is provided AS-IS.
-  *
-  ******************************************************************************
-  */
-/* USER CODE END Header */
+
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 
@@ -33,7 +16,23 @@
 #define CTRL_PID  2
 #define CTRL_LQR  3
 
-#define CONTROL_MODE CTRL_PID
+#define CONTROL_MODE CTRL_LQR
+#define U_MIN_START 0.18f
+
+
+
+// ===== LQI (LQR + integrador) a Ts = 0.1 s =====
+#define DT_MEAS 0.1f
+
+static const float Ad_lqi = 3.7934e-09f;
+static const float Bd_lqi = 0.6601f;
+
+static const float Kx_lqi = 5.7464e-09f;
+static const float Ki_lqi = -0.0104f;
+
+static float x_lqi  = 0.0f;
+static float xi_lqi = 0.0f;
+static const float KI_SCALE = 100.0f;
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
@@ -501,7 +500,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
     int32_t dcnt = encoder_read_delta();
     acc_counts += dcnt;
 
-    // Control se actualiza cada 0.1 s y se mantiene entre updates
+    // Señal de control mantenida entre updates
     static float u = 0.0f;
 
     // Estados comunes PI/PID
@@ -509,23 +508,22 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
     static float y_f = 0.0f;
     static float y_f_prev = 0.0f;
 
-    // Estos dos solo se usan para imprimir si quieres
+    // Referencia para imprimir
     static int32_t ref_cps = 0;
-    static float dy = 0.0f;
 
     div_01s++;
-    if (div_01s >= 25)   // 250 Hz -> 0.1 s => 10 Hz updates
+    if (div_01s >= 25)   // 250 Hz -> 0.1 s
     {
       div_01s = 0;
 
-      // counts/s estimado (0.1 s * 10)
+      // counts/s estimado
       y_cps = acc_counts * 10;
       acc_counts = 0;
 
       // corregir signo (según tu montaje)
       y_cps = -y_cps;
 
-      // Filtro de medición (suaviza cuantización)
+      // filtro
       y_f_prev = y_f;
       y_f = 0.8f * y_f + 0.2f * (float)y_cps;
 
@@ -535,9 +533,8 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
       ref_cps = (t < 2.0f) ? 0 : 17000;
 
       // ======================================================
-      // 3) Control (PI / PID / LQR)
+      // 3) Control (PI / PID / LQR-LQI)
       // ======================================================
-      const float DT_MEAS = 0.1f;   // porque actualizamos cada 0.1 s
       float e = (float)ref_cps - y_f;
 
 #if CONTROL_MODE == CTRL_PI
@@ -551,29 +548,49 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 
       u = (Kp_cps * e) + (Ki_cps * i_term);
 
-      dy = 0.0f; // no usado en PI
-
 #elif CONTROL_MODE == CTRL_PID
 
-      // -------- PID (derivada sobre medición para evitar kick) --------
+      // -------- PID (derivada sobre medición) --------
       const float Kp_cps = 0.00035f;
       const float Ki_cps = 0.00008f;
-      const float Kd_cps = 0.00001f;   // empieza pequeño, luego ajustas
+      const float Kd_cps = 0.00001f;
 
       i_term += e * DT_MEAS;
       i_term = clampf(i_term, -15000.0f, 15000.0f);
 
-      dy = (y_f - y_f_prev) / DT_MEAS;
+      float dy = (y_f - y_f_prev) / DT_MEAS;
 
-      // derivada sobre y: u = Kp*e + Ki*I - Kd*dy
       u = (Kp_cps * e) + (Ki_cps * i_term) - (Kd_cps * dy);
 
 #elif CONTROL_MODE == CTRL_LQR
 
-      // -------- LQR (placeholder por ahora) --------
-      // Cuando lo implementemos: u = -Kx (normalizado)
-      u = 0.0f;
-      dy = 0.0f;
+      // -------- LQI (LQR + integrador) --------
+      // Nota: tus valores Kx son casi 0, así que domina la parte integral.
+      static uint8_t was_zero_ref = 1;
+      if (ref_cps == 0) {
+        was_zero_ref = 1;
+      } else if (was_zero_ref) {
+        was_zero_ref = 0;
+        xi_lqi = 0.0f;
+        x_lqi  = y_f;
+      }
+
+      // Error normalizado
+      const float REF_NORM = 17000.0f;
+      float e_n = e / REF_NORM;
+
+      // Actualizar estado del modelo con u anterior
+      x_lqi = Ad_lqi * x_lqi + Bd_lqi * u;
+
+      // Integrar primero (con límite para no explotar)
+      xi_lqi += e_n * DT_MEAS;
+      xi_lqi = clampf(xi_lqi, -50.0f, 50.0f);
+
+      // Control con escala KI_SCALE (defínelo globalmente)
+      // u = -Kx*x - (KI_SCALE*Ki)*xi
+      float u_raw = -(Kx_lqi * x_lqi) - ((KI_SCALE * Ki_lqi) * xi_lqi);
+
+      u = clampf(u_raw, -1.0f, 1.0f);
 
 #endif
 
@@ -582,8 +599,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 
       // ======================================================
       // 4) UART CSV (10 Hz)
-      // Formato estable: t,ref,y,u
-      // (si quieres incluir dy, agrega otra columna)
+      // Formato: t,ref,y,u
       // ======================================================
       char line[96];
       int n = snprintf(line, sizeof(line),
@@ -593,13 +609,21 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
     }
 
     // ======================================================
-    // 5) Aplicar siempre el último u
+    // 5) Compensación de zona muerta (arranque) + aplicar u
     // ======================================================
+    if (ref_cps > 0) {
+      if (u > 0.0f && u < U_MIN_START)  u = U_MIN_START;
+      if (u < 0.0f && u > -U_MIN_START) u = -U_MIN_START;
+    }
+
     motor_set(u);
 
     k_tick++;
   }
 }
+
+
+
 
 
 
