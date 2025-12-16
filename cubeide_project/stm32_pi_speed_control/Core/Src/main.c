@@ -66,62 +66,51 @@ static void MX_TIM6_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-// ===== AJUSTA ESTO =====
+
+
 #define FS_CTRL   250.0f
 #define TS_CTRL   (1.0f/FS_CTRL)
 
-// Encoder: cuentas por vuelta (CPR = PPR*4)
-// AJUSTA a tu encoder real (ej: PPR=20 -> CPR=80)
+// GA12-N20 típico: PPR=20 por canal, en cuadratura -> CPR=80
 #define CPR       80.0f
 
-// Timer PWM (TIM1) ARR se usa para escalar duty
-// Canal PWM: TIM_CHANNEL_2 (porque TIM1 CH2)
 #define PWM_CH    TIM_CHANNEL_2
+#define UMAX      1.0f
 
-// PI ganancias iniciales (luego las tuneas)
-static float Kp = 0.08f;
-static float Ki = 1.50f;
+// Ganancias desde PID Tuner (PI)
+static const float Kp = 0.072207f;
+static const float Ki = 57.948f;
 
-// Saturación del control en [-1, 1]
-static const float UMAX = 1.0f;
-
-// Referencia de velocidad (RPM). Para prueba: escalón a los 2 s.
+// Referencia (RPM)
 static float ref_rpm = 0.0f;
 
-// Estado PI
+// Estados
 static float i_term = 0.0f;
-
-// Encoder conteo previo
 static int32_t cnt_prev = 0;
-
-// Telemetría
 static uint32_t k_tick = 0;
 
-// Handles (CubeMX los genera). Ajusta nombres si tus handles se llaman distinto.
-extern TIM_HandleTypeDef htim1;   // PWM
-extern TIM_HandleTypeDef htim2;   // Encoder
-extern TIM_HandleTypeDef htim6;   // Loop control
-extern UART_HandleTypeDef huart2; // UART por USB
+extern TIM_HandleTypeDef htim1;   // PWM TIM1
+extern TIM_HandleTypeDef htim2;   // Encoder TIM2
+extern TIM_HandleTypeDef htim6;   // Control loop TIM6
+extern UART_HandleTypeDef huart2; // UART2
 
-// Clamp
 static float clampf(float x, float a, float b){
   if(x < a) return a;
   if(x > b) return b;
   return x;
 }
 
-// Set motor: u_norm en [-1,1] usando L298N (IN1/IN2 + ENA PWM)
-// IN1 = PB5, IN2 = PB4 (según tu config)
 static void motor_set(float u_norm){
   float a = fabsf(u_norm);
   a = clampf(a, 0.0f, 1.0f);
 
+  // IN1=PB5, IN2=PB4 (según tu cableado)
   if(u_norm >= 0.0f){
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, GPIO_PIN_SET);   // IN1
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_4, GPIO_PIN_RESET); // IN2
-  }else{
     HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, GPIO_PIN_RESET);
     HAL_GPIO_WritePin(GPIOB, GPIO_PIN_4, GPIO_PIN_SET);
+  }else{
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_4, GPIO_PIN_RESET);
   }
 
   uint32_t arr = __HAL_TIM_GET_AUTORELOAD(&htim1);
@@ -129,18 +118,18 @@ static void motor_set(float u_norm){
   __HAL_TIM_SET_COMPARE(&htim1, PWM_CH, ccr);
 }
 
-// Lee delta de encoder con wrap básico
 static int32_t encoder_read_delta(void){
   int32_t cnt = (int32_t)__HAL_TIM_GET_COUNTER(&htim2);
   int32_t d = cnt - cnt_prev;
   cnt_prev = cnt;
 
-  // Corrección simple por overflow (16-bit)
+  // wrap 16-bit
   if(d >  32767) d -= 65536;
   if(d < -32768) d += 65536;
 
   return d;
 }
+
 
 /* USER CODE END 0 */
 
@@ -178,17 +167,16 @@ int main(void)
   MX_TIM2_Init();
   MX_TIM6_Init();
   /* USER CODE BEGIN 2 */
-  // Iniciar PWM (TIM1 CH2)
   HAL_TIM_PWM_Start(&htim1, PWM_CH);
-
-  // Iniciar Encoder (TIM2)
   HAL_TIM_Encoder_Start(&htim2, TIM_CHANNEL_ALL);
 
-  // Inicializar conteo previo
   cnt_prev = (int32_t)__HAL_TIM_GET_COUNTER(&htim2);
 
-  // Iniciar Timer de control con interrupción (TIM6)
   HAL_TIM_Base_Start_IT(&htim6);
+
+  // Arranca apagado
+  motor_set(0.0f);
+
 
   /* USER CODE END 2 */
 
@@ -492,18 +480,84 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
   if (htim->Instance == TIM6)
   {
-    // Mantén el motor girando lento
-    motor_set(0.20f);
+    static uint32_t k_tick = 0;
+    float t = k_tick * TS_CTRL;
 
-    // Leer encoder
+    // ==============================
+    // 1) Velocidad (counts/s) 0.1 s
+    // ==============================
+    static int32_t acc_counts = 0;
+    static int32_t y_cps = 0;
+    static uint32_t div_01s = 0;
+
     int32_t dcnt = encoder_read_delta();
+    acc_counts += dcnt;
 
-    // Enviar por UART
-    char line[64];
-    int n = snprintf(line, sizeof(line), "%ld\r\n", (long)dcnt);
-    HAL_UART_Transmit(&huart2, (uint8_t*)line, n, 5);
+    // Control y telemetría se actualizan cada 0.1 s
+    static float u = 0.0f;
+    static float i_term = 0.0f;
+
+    div_01s++;
+    if (div_01s >= 25) {                // 250 Hz -> 0.1 s
+      div_01s = 0;
+
+      y_cps = acc_counts * 10;          // counts/s
+      acc_counts = 0;
+
+      // corregir signo (ya validado)
+      y_cps = -y_cps;
+
+      // filtro simple
+      static float y_f = 0.0f;
+      y_f = 0.8f*y_f + 0.2f*(float)y_cps;
+
+      // ==============================
+      // 2) Setpoint con margen
+      // ==============================
+      int32_t ref_cps = (t < 2.0f) ? 0 : 17000;
+
+      // ==============================
+      // 3) PI (retunado para counts/s)
+      // ==============================
+      float e = (float)ref_cps - y_f;
+
+      // Ganancias (ajuste típico para tu caso)
+      const float Kp_cps = 0.00035f;
+      const float Ki_cps = 0.00008f;
+
+      const float DT_MEAS = 0.1f;       // porque actualizamos cada 0.1 s
+      i_term += e * DT_MEAS;
+
+      // anti-windup: limita contribución integral
+      i_term = clampf(i_term, -15000.0f, 15000.0f);
+
+      u = Kp_cps*e + Ki_cps*i_term;
+      u = clampf(u, -1.0f, 1.0f);
+
+      // ==============================
+      // 4) UART 10 Hz
+      // ==============================
+      char line[96];
+      int n = snprintf(line, sizeof(line),
+                       "%.3f,%ld,%ld,%.3f,%ld\r\n",
+                       t, (long)ref_cps, (long)y_cps, u, (long)dcnt);
+      HAL_UART_Transmit(&huart2, (uint8_t*)line, (uint16_t)n, 5);
+    }
+
+    // aplicar siempre el último u
+    motor_set(u);
+
+    k_tick++;
   }
 }
+
+
+
+
+
+
+
+
 
 
 /* USER CODE END 4 */
