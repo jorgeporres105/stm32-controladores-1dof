@@ -28,15 +28,15 @@ Notas:
 
 
 
-\## Encoder integrado (señales)
+\## Encoder integrado
 
-\- C1 (Canal A) → STM32 PA0 (TIM2\_CH1)
+\- C1 (Canal A) → STM32 PA5 (TIM2\_CH1)
 
 \- C2 (Canal B) → STM32 PA1 (TIM2\_CH2)
 
-\- VCC (encoder) → STM32 3V3 (si el encoder acepta 3.3V)
+\- VCC → 3V3
 
-\- GND (encoder) → GND común
+\- GND → GND común
 
 
 
@@ -69,6 +69,4 @@ Notas:
 \- Si el jumper 5V-EN está puesto, el L298N se autoalimenta lógicamente desde VIN.
 
 \- Si el jumper 5V-EN está quitado, el L298N requiere 5V externos para su lógica (a definir según módulo).
-
-
 
