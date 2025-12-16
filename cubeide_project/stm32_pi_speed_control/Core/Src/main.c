@@ -26,6 +26,14 @@
 #include <math.h>
 
 /* USER CODE END Includes */
+// ===============================
+// Selección de controlador
+// ===============================
+#define CTRL_PI   1
+#define CTRL_PID  2
+#define CTRL_LQR  3
+
+#define CONTROL_MODE CTRL_PID
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
@@ -71,7 +79,7 @@ static void MX_TIM6_Init(void);
 #define FS_CTRL   250.0f
 #define TS_CTRL   (1.0f/FS_CTRL)
 
-// GA12-N20 típico: PPR=20 por canal, en cuadratura -> CPR=80
+
 #define CPR       80.0f
 
 #define PWM_CH    TIM_CHANNEL_2
@@ -104,7 +112,7 @@ static void motor_set(float u_norm){
   float a = fabsf(u_norm);
   a = clampf(a, 0.0f, 1.0f);
 
-  // IN1=PB5, IN2=PB4 (según tu cableado)
+  // IN1=PB5, IN2=PB4
   if(u_norm >= 0.0f){
     HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, GPIO_PIN_RESET);
     HAL_GPIO_WritePin(GPIOB, GPIO_PIN_4, GPIO_PIN_SET);
@@ -483,73 +491,116 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
     static uint32_t k_tick = 0;
     float t = k_tick * TS_CTRL;
 
-    // ==============================
-    // 1) Velocidad (counts/s) 0.1 s
-    // ==============================
-    static int32_t acc_counts = 0;
-    static int32_t y_cps = 0;
+    // ======================================================
+    // 1) Medición de velocidad en counts/s (ventana 0.1 s)
+    // ======================================================
+    static int32_t  acc_counts = 0;
+    static int32_t  y_cps = 0;
     static uint32_t div_01s = 0;
 
     int32_t dcnt = encoder_read_delta();
     acc_counts += dcnt;
 
-    // Control y telemetría se actualizan cada 0.1 s
+    // Control se actualiza cada 0.1 s y se mantiene entre updates
     static float u = 0.0f;
+
+    // Estados comunes PI/PID
     static float i_term = 0.0f;
+    static float y_f = 0.0f;
+    static float y_f_prev = 0.0f;
+
+    // Estos dos solo se usan para imprimir si quieres
+    static int32_t ref_cps = 0;
+    static float dy = 0.0f;
 
     div_01s++;
-    if (div_01s >= 25) {                // 250 Hz -> 0.1 s
+    if (div_01s >= 25)   // 250 Hz -> 0.1 s => 10 Hz updates
+    {
       div_01s = 0;
 
-      y_cps = acc_counts * 10;          // counts/s
+      // counts/s estimado (0.1 s * 10)
+      y_cps = acc_counts * 10;
       acc_counts = 0;
 
-      // corregir signo (ya validado)
+      // corregir signo (según tu montaje)
       y_cps = -y_cps;
 
-      // filtro simple
-      static float y_f = 0.0f;
-      y_f = 0.8f*y_f + 0.2f*(float)y_cps;
+      // Filtro de medición (suaviza cuantización)
+      y_f_prev = y_f;
+      y_f = 0.8f * y_f + 0.2f * (float)y_cps;
 
-      // ==============================
-      // 2) Setpoint con margen
-      // ==============================
-      int32_t ref_cps = (t < 2.0f) ? 0 : 17000;
+      // ======================================================
+      // 2) Referencia (escalón)
+      // ======================================================
+      ref_cps = (t < 2.0f) ? 0 : 17000;
 
-      // ==============================
-      // 3) PI (retunado para counts/s)
-      // ==============================
+      // ======================================================
+      // 3) Control (PI / PID / LQR)
+      // ======================================================
+      const float DT_MEAS = 0.1f;   // porque actualizamos cada 0.1 s
       float e = (float)ref_cps - y_f;
 
-      // Ganancias (ajuste típico para tu caso)
+#if CONTROL_MODE == CTRL_PI
+
+      // -------- PI --------
       const float Kp_cps = 0.00035f;
       const float Ki_cps = 0.00008f;
 
-      const float DT_MEAS = 0.1f;       // porque actualizamos cada 0.1 s
       i_term += e * DT_MEAS;
-
-      // anti-windup: limita contribución integral
       i_term = clampf(i_term, -15000.0f, 15000.0f);
 
-      u = Kp_cps*e + Ki_cps*i_term;
+      u = (Kp_cps * e) + (Ki_cps * i_term);
+
+      dy = 0.0f; // no usado en PI
+
+#elif CONTROL_MODE == CTRL_PID
+
+      // -------- PID (derivada sobre medición para evitar kick) --------
+      const float Kp_cps = 0.00035f;
+      const float Ki_cps = 0.00008f;
+      const float Kd_cps = 0.00001f;   // empieza pequeño, luego ajustas
+
+      i_term += e * DT_MEAS;
+      i_term = clampf(i_term, -15000.0f, 15000.0f);
+
+      dy = (y_f - y_f_prev) / DT_MEAS;
+
+      // derivada sobre y: u = Kp*e + Ki*I - Kd*dy
+      u = (Kp_cps * e) + (Ki_cps * i_term) - (Kd_cps * dy);
+
+#elif CONTROL_MODE == CTRL_LQR
+
+      // -------- LQR (placeholder por ahora) --------
+      // Cuando lo implementemos: u = -Kx (normalizado)
+      u = 0.0f;
+      dy = 0.0f;
+
+#endif
+
+      // Saturación final común
       u = clampf(u, -1.0f, 1.0f);
 
-      // ==============================
-      // 4) UART 10 Hz
-      // ==============================
+      // ======================================================
+      // 4) UART CSV (10 Hz)
+      // Formato estable: t,ref,y,u
+      // (si quieres incluir dy, agrega otra columna)
+      // ======================================================
       char line[96];
       int n = snprintf(line, sizeof(line),
-                       "%.3f,%ld,%ld,%.3f,%ld\r\n",
-                       t, (long)ref_cps, (long)y_cps, u, (long)dcnt);
+                       "%.3f,%ld,%ld,%.3f\r\n",
+                       t, (long)ref_cps, (long)y_cps, u);
       HAL_UART_Transmit(&huart2, (uint8_t*)line, (uint16_t)n, 5);
     }
 
-    // aplicar siempre el último u
+    // ======================================================
+    // 5) Aplicar siempre el último u
+    // ======================================================
     motor_set(u);
 
     k_tick++;
   }
 }
+
 
 
 
